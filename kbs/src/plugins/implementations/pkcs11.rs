@@ -4,10 +4,10 @@
 
 //! This module provides plugin support for the cryptographic backend.
 //!
-//! For more information about PKCS#11 and the methodologies used, see the following
-//! [PKCS#11 Usage Guide] (https://docs.oasis-open.org/pkcs11/pkcs11-ug/v3.2/pkcs11-ug-v3.2.html)
-//! [PKCS#11 Specification v3.0](https://docs.oasis-open.org/pkcs11/pkcs11-spec/v3.2/pkcs11-spec-v3.2.html)
-//! [PKCS#11 Base Specification v3.0](https://docs.oasis-open.org/pkcs11/pkcs11-base/v3.0/os/pkcs11-base-v3.0-os.html).
+//! For more information about PKCS_11 and the methodologies used, see the following
+//! * [PKCS_11 Usage Guide](<https://docs.oasis-open.org/pkcs11/pkcs11-ug/v3.2/pkcs11-ug-v3.2.html>)
+//! * [PKCS_11 Specification v3.0](<https://docs.oasis-open.org/pkcs11/pkcs11-spec/v3.2/pkcs11-spec-v3.2.html>)
+//! * [PKCS_11 Base Specification v3.0](<https://docs.oasis-open.org/pkcs11/pkcs11-base/v3.0/os/pkcs11-base-v3.0-os.html>)
 use crate::plugins::resource::{ResourceDesc, StorageBackend};
 use actix_web::http::Method;
 use anyhow::{anyhow, bail, Context, Result};
@@ -29,6 +29,42 @@ use uuid::Uuid;
 
 use super::super::plugin_manager::ClientPlugin;
 
+
+/// Enum representing supported RSA mechanisms.
+#[derive(Derivative, Deserialize, Clone, PartialEq)]
+#[derivative(Debug)]
+pub enum RsaMechanism {
+    /// RSA mechanism using PKCS#1 OAEP MGF1_SHA256 padding. Recommended for secure production use.
+    RsaPkcsOaep,
+    /// RSA mechanism using PKCS#1 v1.5 with MGF1_SHA256 padding.
+    ///
+    /// ⚠️ This mechanism relies on SHA-1, which is considered deprecated and insecure.
+    /// It should only be used for testing or legacy compatibility purposes.    
+    RsaPkcsTest,
+}
+
+impl Default for RsaMechanism {
+    fn default() -> Self {
+        RsaMechanism::RsaPkcsOaep
+    }
+}
+impl RsaMechanism {
+    pub fn to_pkcs11_mechanism(&self) -> Mechanism {
+        match self {
+            RsaMechanism::RsaPkcsOaep => Mechanism::RsaPkcsOaep(PkcsOaepParams::new(
+                MechanismType::SHA256,
+                PkcsMgfType::MGF1_SHA256,
+                PkcsOaepSource::empty(),
+            )),
+            RsaMechanism::RsaPkcsTest => Mechanism::RsaPkcsOaep(PkcsOaepParams::new(
+                MechanismType::SHA1,
+                PkcsMgfType::MGF1_SHA1,
+                PkcsOaepSource::empty(),
+            )),
+        }
+    }
+}
+
 #[derive(Derivative, Deserialize, Clone, PartialEq)]
 #[derivative(Debug)]
 pub struct Pkcs11Config {
@@ -42,7 +78,12 @@ pub struct Pkcs11Config {
     /// The user pin for authenticating the session.
     #[derivative(Debug = "ignore")]
     pin: String,
+
+    /// RSA mechanism to use.
+    #[serde(default)]
+    rsa_mechanism: RsaMechanism,
 }
+
 
 pub struct Pkcs11Backend {
     session: Arc<Mutex<Session>>,
@@ -244,18 +285,13 @@ impl Pkcs11Backend {
             .await
             .find_objects(&pubkey_template)
             .context("unable to find public wrap key in PKCS11 module")?;
-
+        let mechanism = self.rsa_mechanism.to_pkcs11_mechanism();
         let encrypted = self
             .session
             .lock()
             .await
             // NOTICE deprecated by NIST
-            .encrypt(
-                &Mechanism::RsaPkcsOaep(PkcsOaepParams::new(
-                    MechanismType::SHA1,
-                    PkcsMgfType::MGF1_SHA1,
-                    PkcsOaepSource::empty(),
-                )),
+            .encrypt(mechanism,
                 pubkey.remove(0),
                 body,
             )
@@ -275,18 +311,13 @@ impl Pkcs11Backend {
             .await
             .find_objects(&privkey_template)
             .context("unable to find private wrap key in PKCS11 module")?;
-
+        let mechanism = self.rsa_mechanism.to_pkcs11_mechanism();
         let decrypted = self
             .session
             .lock()
             .await
             // NOTICE deprecated by NIST
-            .decrypt(
-                &Mechanism::RsaPkcsOaep(PkcsOaepParams::new(
-                    MechanismType::SHA1,
-                    PkcsMgfType::MGF1_SHA1,
-                    PkcsOaepSource::empty(),
-                )),
+            .decrypt(mechanism,
                 privkey.remove(0),
                 body,
             )
@@ -299,7 +330,7 @@ impl Pkcs11Backend {
 #[cfg(test)]
 mod tests {
     use crate::plugins::{
-        pkcs11::{Pkcs11Backend, Pkcs11Config},
+        pkcs11::{Pkcs11Backend, Pkcs11Config,RsaMechanism::{RsaPkcsTest,RsaPkcsOaep}},
         resource::backend::{ResourceDesc, StorageBackend},
     };
     use serial_test::serial;
@@ -316,6 +347,7 @@ mod tests {
             slot_index: 0,
             // This pin must be set for SoftHSM
             pin: "12345678".to_string(),
+            rsa_mechanism: RsaPkcsTest
         };
 
         let backend = Pkcs11Backend::try_from(config).unwrap();
@@ -348,6 +380,7 @@ mod tests {
             slot_index: 0,
             // This pin must be set for SoftHSM
             pin: "12345678".to_string(),
+            rsa_mechanism: RsaPkcsTest
         };
 
         let backend = Pkcs11Backend::try_from(config).unwrap();
@@ -362,4 +395,27 @@ mod tests {
 
         assert_eq!(data.as_bytes(), unwrapped);
     }
+    #[tokio::test]
+    #[should_panic]
+    async fn expected_failure_using_softhsm_mfg_sha256() {
+        let config = Pkcs11Config {
+            module: "/usr/lib/softhsm/libsofthsm2.so".into(),
+            slot_index: 0,
+            // This pin must be set for SoftHSM
+            pin: "12345678".to_string(),
+            rsa_mechanism: RsaPkcsOaep
+        };
+
+        let backend = Pkcs11Backend::try_from(config).unwrap();
+
+        let data = "TEST";
+
+        let wrapped = backend.wrapkey_wrap(data.as_bytes()).await.unwrap();
+
+        assert_ne!(data.as_bytes(), wrapped);
+
+        let unwrapped = backend.wrapkey_unwrap(&wrapped).await.unwrap();
+
+        assert_eq!(data.as_bytes(), unwrapped);
+    }    
 }
