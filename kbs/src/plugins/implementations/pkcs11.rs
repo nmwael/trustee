@@ -31,24 +31,21 @@ use super::super::plugin_manager::ClientPlugin;
 
 
 /// Enum representing supported RSA mechanisms.
-#[derive(Derivative, Deserialize, Clone, PartialEq)]
+#[derive(Derivative, Deserialize, Clone, PartialEq,Default)]
 #[derivative(Debug)]
 pub enum RsaMechanism {
     /// RSA mechanism using PKCS#1 OAEP MGF1_SHA256 padding. Recommended for secure production use.
+    #[default]
     RsaPkcsOaep,
-    /// RSA mechanism using PKCS#1 v1.5 with MGF1_SHA256 padding.
+    /// RSA mechanism using PKCS#1 v1.5 with MGF1_SHA1 padding.
     ///
     /// ⚠️ This mechanism relies on SHA-1, which is considered deprecated and insecure.
     /// It should only be used for testing or legacy compatibility purposes.    
     RsaPkcsTest,
 }
 
-impl Default for RsaMechanism {
-    fn default() -> Self {
-        RsaMechanism::RsaPkcsOaep
-    }
-}
 impl RsaMechanism {
+    /// Converts the enum variant into a corresponding PKCS#11 mechanism.
     pub fn to_pkcs11_mechanism(&self) -> Mechanism {
         match self {
             RsaMechanism::RsaPkcsOaep => Mechanism::RsaPkcsOaep(PkcsOaepParams::new(
@@ -88,12 +85,14 @@ pub struct Pkcs11Config {
 pub struct Pkcs11Backend {
     session: Arc<Mutex<Session>>,
     wrapkey_id: Uuid,
+    rsa_mechanism:Arc<RsaMechanism>
 }
 
 impl TryFrom<Pkcs11Config> for Pkcs11Backend {
     type Error = anyhow::Error;
 
     fn try_from(config: Pkcs11Config) -> anyhow::Result<Self> {
+        let rsa_mechanism = Arc::new(config.rsa_mechanism);
         let pkcs11 = Pkcs11::new(config.module).context("unable to open pkcs11 module")?;
         pkcs11.initialize(CInitializeArgs::OsThreads).unwrap();
 
@@ -114,7 +113,7 @@ impl TryFrom<Pkcs11Config> for Pkcs11Backend {
 
         Ok(Self {
             session: Arc::new(Mutex::new(session)),
-            wrapkey_id,
+            wrapkey_id, rsa_mechanism:rsa_mechanism.clone()
         })
     }
 }
@@ -285,13 +284,13 @@ impl Pkcs11Backend {
             .await
             .find_objects(&pubkey_template)
             .context("unable to find public wrap key in PKCS11 module")?;
-        let mechanism = self.rsa_mechanism.to_pkcs11_mechanism();
+        
         let encrypted = self
             .session
             .lock()
             .await
             // NOTICE deprecated by NIST
-            .encrypt(mechanism,
+            .encrypt(&self.rsa_mechanism.to_pkcs11_mechanism(),
                 pubkey.remove(0),
                 body,
             )
@@ -311,13 +310,12 @@ impl Pkcs11Backend {
             .await
             .find_objects(&privkey_template)
             .context("unable to find private wrap key in PKCS11 module")?;
-        let mechanism = self.rsa_mechanism.to_pkcs11_mechanism();
         let decrypted = self
             .session
             .lock()
             .await
             // NOTICE deprecated by NIST
-            .decrypt(mechanism,
+            .decrypt(&self.rsa_mechanism.to_pkcs11_mechanism(),
                 privkey.remove(0),
                 body,
             )
@@ -326,7 +324,7 @@ impl Pkcs11Backend {
         Ok(decrypted)
     }
 }
-
+/// In general tests using softhsm has to run in a serial scope as they are session locked
 #[cfg(test)]
 mod tests {
     use crate::plugins::{
@@ -334,11 +332,44 @@ mod tests {
         resource::backend::{ResourceDesc, StorageBackend},
     };
     use serial_test::serial;
+    
+    use std::process::Command;
+    use std::sync::Once;
+    static INIT: Once = Once::new();
+
+    fn before_all() {
+        INIT.call_once(|| {
+            let status = Command::new("bash")
+                .arg("kbs/test/script/plugin/pkcs11/test_setup.sh")
+                .status()
+                .expect("failed to run setup script");
+            assert!(status.success(), "setup script failed");
+        });
+    }
+    
+    fn after_all() {
+        let status = Command::new("bash")
+            .arg("kbs/test/script/plugin/pkcs11/test_teardown.sh")
+            .status()
+            .expect("failed to run teardown script");
+        assert!(status.success(), "teardown script failed");
+    }
+
+
+    #[test]
+    fn test_one() {
+        before_all();
+        // test logic here
+        after_all(); // optional if you want to run it after each test
+    }
+
 
     const TEST_DATA: &[u8] = b"testdata";
 
+
+
+
     // This will only work if SoftHSM is setup accordingly.
-    #[ignore]
     #[tokio::test]
     #[serial]
     async fn write_and_read_resource() {
@@ -371,7 +402,6 @@ mod tests {
     }
 
     // This will only work is SoftHsm is setup accordingly.
-    #[ignore]
     #[tokio::test]
     #[serial]
     async fn wrap_and_unwrap_data() {
@@ -396,7 +426,8 @@ mod tests {
         assert_eq!(data.as_bytes(), unwrapped);
     }
     #[tokio::test]
-    #[should_panic]
+    #[should_panic(expected= "PKCS11 error")]
+    #[serial]
     async fn expected_failure_using_softhsm_mfg_sha256() {
         let config = Pkcs11Config {
             module: "/usr/lib/softhsm/libsofthsm2.so".into(),
@@ -405,17 +436,11 @@ mod tests {
             pin: "12345678".to_string(),
             rsa_mechanism: RsaPkcsOaep
         };
-
         let backend = Pkcs11Backend::try_from(config).unwrap();
 
         let data = "TEST";
 
-        let wrapped = backend.wrapkey_wrap(data.as_bytes()).await.unwrap();
+        let _wrapped = backend.wrapkey_wrap(data.as_bytes()).await.unwrap();
 
-        assert_ne!(data.as_bytes(), wrapped);
-
-        let unwrapped = backend.wrapkey_unwrap(&wrapped).await.unwrap();
-
-        assert_eq!(data.as_bytes(), unwrapped);
     }    
 }
