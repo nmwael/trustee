@@ -79,12 +79,16 @@ pub struct Pkcs11Config {
     /// RSA mechanism to use.
     #[serde(default)]
     rsa_mechanism: RsaMechanism,
+
+    /// String used to lookup private or public key for cryptographic operations
+    #[serde(default)]
+    lookup_label: String,
 }
 
 
 pub struct Pkcs11Backend {
     session: Arc<Mutex<Session>>,
-    wrapkey_id: Uuid,
+    lookup_label: String,
     rsa_mechanism:Arc<RsaMechanism>
 }
 
@@ -102,18 +106,18 @@ impl TryFrom<Pkcs11Config> for Pkcs11Backend {
             bail!("Slot index out of range");
         }
 
-        let mut session = pkcs11.open_rw_session(slots[slot_index])?;
+        let session = pkcs11.open_rw_session(slots[slot_index])?;
         session.login(UserType::User, Some(&AuthPin::new(config.pin.clone())))?;
 
         // Generate a UUID to for the wrapping keypair.
-        let wrapkey_id = Uuid::new_v4();
+        //let wrapkey_id = Uuid::new_v4();
 
         // Create the HSM wrapping keypair.
-        Pkcs11Backend::wrap_key_new(&mut session, &wrapkey_id)?;
-
+        // Pkcs11Backend::wrap_key_new(&mut session, &wrapkey_id)?;
+        let lookup_label = config.lookup_label;
         Ok(Self {
             session: Arc::new(Mutex::new(session)),
-            wrapkey_id, rsa_mechanism:rsa_mechanism.clone()
+            rsa_mechanism:rsa_mechanism.clone(), lookup_label
         })
     }
 }
@@ -274,9 +278,7 @@ impl Pkcs11Backend {
     }
 
     async fn wrapkey_wrap(&self, body: &[u8]) -> Result<Vec<u8>> {
-        let pubkey_template = vec![Attribute::Label(
-            format!("trustee-{}-public", self.wrapkey_id).into(),
-        )];
+        let pubkey_template = vec![Attribute::Label(self.lookup_label.clone().into()), Attribute::Class(ObjectClass::PUBLIC_KEY)];
 
         let mut pubkey = self
             .session
@@ -289,7 +291,6 @@ impl Pkcs11Backend {
             .session
             .lock()
             .await
-            // NOTICE deprecated by NIST
             .encrypt(&self.rsa_mechanism.to_pkcs11_mechanism(),
                 pubkey.remove(0),
                 body,
@@ -300,9 +301,7 @@ impl Pkcs11Backend {
     }
 
     async fn wrapkey_unwrap(&self, body: &[u8]) -> Result<Vec<u8>> {
-        let privkey_template = vec![Attribute::Label(
-            format!("trustee-{}-private", self.wrapkey_id).into(),
-        )];
+        let privkey_template = vec![Attribute::Label(self.lookup_label.clone().into()), Attribute::Class(ObjectClass::PRIVATE_KEY)];
 
         let mut privkey = self
             .session
@@ -314,7 +313,6 @@ impl Pkcs11Backend {
             .session
             .lock()
             .await
-            // NOTICE deprecated by NIST
             .decrypt(&self.rsa_mechanism.to_pkcs11_mechanism(),
                 privkey.remove(0),
                 body,
@@ -334,33 +332,38 @@ mod tests {
     use serial_test::serial;
     
     use std::process::Command;
-    use std::sync::Once;
-    static INIT: Once = Once::new();
+    static LOOKUP_LABEL: &'static str="trustee-test";
+    static HSM_USER_PIN: &'static str="12345678";
+    static SOFTHSM_PATH: &'static str="/usr/lib/softhsm/libsofthsm2.so";
 
-    fn before_all() {
-        INIT.call_once(|| {
+    async fn before_test() {
+       
             let status = Command::new("bash")
-                .arg("kbs/test/script/plugin/pkcs11/test_setup.sh")
+                .arg("test/script/plugin/pkcs11/".to_owned()+"generate_keypair_with_label.sh").arg(LOOKUP_LABEL).arg(HSM_USER_PIN).arg(SOFTHSM_PATH)
                 .status()
                 .expect("failed to run setup script");
             assert!(status.success(), "setup script failed");
-        });
+        
     }
-    
-    fn after_all() {
+
+    async fn after_test() {
+
         let status = Command::new("bash")
-            .arg("kbs/test/script/plugin/pkcs11/test_teardown.sh")
+            .arg("test/script/plugin/pkcs11/".to_owned()+"delete_by_label.sh").arg(LOOKUP_LABEL).arg(HSM_USER_PIN).arg(SOFTHSM_PATH)
+            
             .status()
             .expect("failed to run teardown script");
         assert!(status.success(), "teardown script failed");
+
     }
 
 
-    #[test]
-    fn test_one() {
-        before_all();
+    #[tokio::test]
+    #[serial]
+    async fn test_one() {
+        before_test().await;
         // test logic here
-        after_all(); // optional if you want to run it after each test
+        after_test().await;
     }
 
 
@@ -378,7 +381,8 @@ mod tests {
             slot_index: 0,
             // This pin must be set for SoftHSM
             pin: "12345678".to_string(),
-            rsa_mechanism: RsaPkcsTest
+            rsa_mechanism: RsaPkcsTest,
+            lookup_label: "".into()
         };
 
         let backend = Pkcs11Backend::try_from(config).unwrap();
@@ -405,12 +409,14 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn wrap_and_unwrap_data() {
-        let config = Pkcs11Config {
+        before_test().await;
+         let config = Pkcs11Config {
             module: "/usr/lib/softhsm/libsofthsm2.so".into(),
             slot_index: 0,
             // This pin must be set for SoftHSM
             pin: "12345678".to_string(),
-            rsa_mechanism: RsaPkcsTest
+            rsa_mechanism: RsaPkcsTest,
+            lookup_label: LOOKUP_LABEL.to_string()
         };
 
         let backend = Pkcs11Backend::try_from(config).unwrap();
@@ -424,23 +430,27 @@ mod tests {
         let unwrapped = backend.wrapkey_unwrap(&wrapped).await.unwrap();
 
         assert_eq!(data.as_bytes(), unwrapped);
+        after_test().await;
     }
     #[tokio::test]
     #[should_panic(expected= "PKCS11 error")]
     #[serial]
     async fn expected_failure_using_softhsm_mfg_sha256() {
+        before_test().await;
         let config = Pkcs11Config {
             module: "/usr/lib/softhsm/libsofthsm2.so".into(),
             slot_index: 0,
             // This pin must be set for SoftHSM
             pin: "12345678".to_string(),
-            rsa_mechanism: RsaPkcsOaep
+            rsa_mechanism: RsaPkcsOaep,
+            lookup_label: LOOKUP_LABEL.to_string()
         };
         let backend = Pkcs11Backend::try_from(config).unwrap();
 
         let data = "TEST";
 
         let _wrapped = backend.wrapkey_wrap(data.as_bytes()).await.unwrap();
+        after_test().await;
 
     }    
 }
