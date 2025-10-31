@@ -13,12 +13,7 @@ RUN apt-get update && \
     gpg \
     gnupg-agent \
     git \
-    sudo \
-
-#Install softhsm for pkcs11 plugin Tests    
-RUN apt-get install -y --no-install-recommends softhsm
-#SETUP softhsm for pkcs11 plugin Tests
-RUN softhsm2-util --init-token --free --label "Trustee pkcs11 test" --so-pin 12345678 --pin 12345678
+    sudo 
 
 RUN if [ "${ARCH}" = "aarch64" ]; then apt-get install -y libc-bin; fi
 
