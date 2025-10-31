@@ -377,10 +377,10 @@ mod tests {
     #[serial]
     async fn write_and_read_resource() {
         let config = Pkcs11Config {
-            module: "/usr/lib/softhsm/libsofthsm2.so".into(),
+            module: SOFTHSM_PATH.into(),
             slot_index: 0,
             // This pin must be set for SoftHSM
-            pin: "12345678".to_string(),
+            pin: HSM_USER_PIN.to_string(),
             rsa_mechanism: RsaPkcsTest,
             lookup_label: "".into()
         };
@@ -411,10 +411,10 @@ mod tests {
     async fn wrap_and_unwrap_data() {
         before_test().await;
          let config = Pkcs11Config {
-            module: "/usr/lib/softhsm/libsofthsm2.so".into(),
+            module: SOFTHSM_PATH.into(),
             slot_index: 0,
             // This pin must be set for SoftHSM
-            pin: "12345678".to_string(),
+            pin: HSM_USER_PIN.to_string(),
             rsa_mechanism: RsaPkcsTest,
             lookup_label: LOOKUP_LABEL.to_string()
         };
@@ -438,10 +438,10 @@ mod tests {
     async fn expected_failure_using_softhsm_mfg_sha256() {
         before_test().await;
         let config = Pkcs11Config {
-            module: "/usr/lib/softhsm/libsofthsm2.so".into(),
+            module: SOFTHSM_PATH.into(),
             slot_index: 0,
             // This pin must be set for SoftHSM
-            pin: "12345678".to_string(),
+            pin: HSM_USER_PIN.to_string(),
             rsa_mechanism: RsaPkcsOaep,
             lookup_label: LOOKUP_LABEL.to_string()
         };
