@@ -28,9 +28,9 @@ jobs:
       matrix:
         include:
         - instance: ubuntu-24.04
-          test_features: ""
+          test_features: "pkcs11"
         - instance: ubuntu-24.04-arm
-          test_features: "coco-as-builtin,coco-as-grpc,intel-trust-authority-as,sample_only,cca-attester"
+          test_features: "coco-as-builtin,coco-as-grpc,intel-trust-authority-as,sample_only,cca-attester,pkcs11"
     runs-on: ${{ matrix.instance }}
 
     steps:
@@ -80,6 +80,14 @@ jobs:
     - name: Format
       working-directory: kbs
       run: make format
+
+    - name: setup softhsm for pkcs11 tests
+      if: contains(matrix.test_features, 'pkcs11')
+      working-directory: kbs
+      run: |
+        echo "Setting up PKCS#11 for ${{ matrix.instance }}"
+        apt-get install -y --no-install-recommends softhsm2
+        softhsm2-util --init-token --free --label "Trustee pkcs11 test" --so-pin 12345678 --pin 12345678
 
     - name: Test
       working-directory: kbs
