@@ -13,7 +13,7 @@ RUN apt-get update && \
     gpg \
     gnupg-agent \
     git \
-    sudo
+    sudo 
 
 RUN if [ "${ARCH}" = "aarch64" ]; then apt-get install -y libc-bin; fi
 
