@@ -25,7 +25,6 @@ use derivative::Derivative;
 use serde::Deserialize;
 use std::{path::PathBuf, sync::Arc};
 use tokio::sync::Mutex;
-use uuid::Uuid;
 
 use super::super::plugin_manager::ClientPlugin;
 
@@ -109,11 +108,6 @@ impl TryFrom<Pkcs11Config> for Pkcs11Backend {
         let session = pkcs11.open_rw_session(slots[slot_index])?;
         session.login(UserType::User, Some(&AuthPin::new(config.pin.clone())))?;
 
-        // Generate a UUID to for the wrapping keypair.
-        //let wrapkey_id = Uuid::new_v4();
-
-        // Create the HSM wrapping keypair.
-        // Pkcs11Backend::wrap_key_new(&mut session, &wrapkey_id)?;
         let lookup_label = config.lookup_label;
         Ok(Self {
             session: Arc::new(Mutex::new(session)),
@@ -243,38 +237,6 @@ impl Pkcs11Backend {
             Method::GET => self.wrapkey_unwrap(body).await,
             _ => bail!("invalid method"),
         }
-    }
-
-    fn wrap_key_new(session: &mut Session, label: &Uuid) -> Result<()> {
-        let public_template = vec![
-            Attribute::Token(true),
-            Attribute::Private(true),
-            Attribute::KeyType(KeyType::RSA),
-            Attribute::Class(ObjectClass::PUBLIC_KEY),
-            Attribute::ModulusBits(4096.into()),
-            Attribute::PublicExponent(vec![0x01, 0x00, 0x01]), // 65537
-            Attribute::Encrypt(true),
-            Attribute::Label(format!("trustee-{}-public", label).into()),
-        ];
-
-        let private_template = vec![
-            Attribute::Token(true),
-            Attribute::Private(true),
-            Attribute::KeyType(KeyType::RSA),
-            Attribute::Decrypt(true),
-            Attribute::Class(ObjectClass::PRIVATE_KEY),
-            Attribute::Label(format!("trustee-{}-private", label).into()),
-        ];
-
-        let (_, _) = session
-            .generate_key_pair(
-                &Mechanism::RsaPkcsKeyPairGen,
-                &public_template,
-                &private_template,
-            )
-            .context("unable to generate RSA wrap key pair")?;
-
-        Ok(())
     }
 
     async fn wrapkey_wrap(&self, body: &[u8]) -> Result<Vec<u8>> {
