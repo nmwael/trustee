@@ -28,9 +28,8 @@ use tokio::sync::Mutex;
 
 use super::super::plugin_manager::ClientPlugin;
 
-
 /// Enum representing supported RSA mechanisms.
-#[derive(Derivative, Deserialize, Clone, PartialEq,Default)]
+#[derive(Derivative, Deserialize, Clone, PartialEq, Default)]
 #[derivative(Debug)]
 pub enum RsaMechanism {
     /// RSA mechanism using PKCS#1 OAEP MGF1_SHA256 padding. Recommended for secure production use.
@@ -84,11 +83,10 @@ pub struct Pkcs11Config {
     lookup_label: String,
 }
 
-
 pub struct Pkcs11Backend {
     session: Arc<Mutex<Session>>,
     lookup_label: String,
-    rsa_mechanism:Arc<RsaMechanism>
+    rsa_mechanism: Arc<RsaMechanism>,
 }
 
 impl TryFrom<Pkcs11Config> for Pkcs11Backend {
@@ -111,7 +109,8 @@ impl TryFrom<Pkcs11Config> for Pkcs11Backend {
         let lookup_label = config.lookup_label;
         Ok(Self {
             session: Arc::new(Mutex::new(session)),
-            rsa_mechanism:rsa_mechanism.clone(), lookup_label
+            rsa_mechanism: rsa_mechanism.clone(),
+            lookup_label,
         })
     }
 }
@@ -240,7 +239,10 @@ impl Pkcs11Backend {
     }
 
     async fn wrapkey_wrap(&self, body: &[u8]) -> Result<Vec<u8>> {
-        let pubkey_template = vec![Attribute::Label(self.lookup_label.clone().into()), Attribute::Class(ObjectClass::PUBLIC_KEY)];
+        let pubkey_template = vec![
+            Attribute::Label(self.lookup_label.clone().into()),
+            Attribute::Class(ObjectClass::PUBLIC_KEY),
+        ];
 
         let mut pubkey = self
             .session
@@ -248,12 +250,13 @@ impl Pkcs11Backend {
             .await
             .find_objects(&pubkey_template)
             .context("unable to find public wrap key in PKCS11 module")?;
-        
+
         let encrypted = self
             .session
             .lock()
             .await
-            .encrypt(&self.rsa_mechanism.to_pkcs11_mechanism(),
+            .encrypt(
+                &self.rsa_mechanism.to_pkcs11_mechanism(),
                 pubkey.remove(0),
                 body,
             )
@@ -263,7 +266,10 @@ impl Pkcs11Backend {
     }
 
     async fn wrapkey_unwrap(&self, body: &[u8]) -> Result<Vec<u8>> {
-        let privkey_template = vec![Attribute::Label(self.lookup_label.clone().into()), Attribute::Class(ObjectClass::PRIVATE_KEY)];
+        let privkey_template = vec![
+            Attribute::Label(self.lookup_label.clone().into()),
+            Attribute::Class(ObjectClass::PRIVATE_KEY),
+        ];
 
         let mut privkey = self
             .session
@@ -275,7 +281,8 @@ impl Pkcs11Backend {
             .session
             .lock()
             .await
-            .decrypt(&self.rsa_mechanism.to_pkcs11_mechanism(),
+            .decrypt(
+                &self.rsa_mechanism.to_pkcs11_mechanism(),
                 privkey.remove(0),
                 body,
             )
@@ -288,51 +295,45 @@ impl Pkcs11Backend {
 #[cfg(test)]
 mod tests {
     use crate::plugins::{
-        pkcs11::{Pkcs11Backend, Pkcs11Config,RsaMechanism::{RsaPkcsTest,RsaPkcsOaep}},
+        pkcs11::{
+            Pkcs11Backend, Pkcs11Config,
+            RsaMechanism::{RsaPkcsOaep, RsaPkcsTest},
+        },
         resource::backend::{ResourceDesc, StorageBackend},
     };
     use serial_test::serial;
-    
     use std::process::Command;
-    static LOOKUP_LABEL: &'static str="trustee-test";
-    static HSM_USER_PIN: &'static str="12345678";
-    static SOFTHSM_PATH: &'static str="/usr/lib/softhsm/libsofthsm2.so";
+
+    static LOOKUP_LABEL: &'static str = "trustee-test";
+    static HSM_USER_PIN: &'static str = "12345678";
+    static SOFTHSM_PATH: &'static str = "/usr/lib/softhsm/libsofthsm2.so";
 
     async fn before_test() {
-       
-            let status = Command::new("bash")
-                .arg("test/script/plugin/pkcs11/".to_owned()+"generate_keypair_with_label.sh").arg(LOOKUP_LABEL).arg(HSM_USER_PIN).arg(SOFTHSM_PATH)
-                .status()
-                .expect("failed to run setup script");
-            assert!(status.success(), "setup script failed");
-        
-    }
-
-    async fn after_test() {
-
         let status = Command::new("bash")
-            .arg("test/script/plugin/pkcs11/".to_owned()+"delete_by_label.sh").arg(LOOKUP_LABEL).arg(HSM_USER_PIN).arg(SOFTHSM_PATH)
-            
+            .arg("test/script/plugin/pkcs11/".to_owned() + "generate_keypair_with_label.sh")
+            .arg(LOOKUP_LABEL)
+            .arg(HSM_USER_PIN)
+            .arg(SOFTHSM_PATH)
             .status()
-            .expect("failed to run teardown script");
-        assert!(status.success(), "teardown script failed");
-
+            .expect("failed to run setup script");
+        assert!(status.success(), "setup script failed");
     }
-
-
-    #[tokio::test]
-    #[serial]
-    async fn test_one() {
-        before_test().await;
-        // test logic here
-        after_test().await;
+    struct Teardown;
+    impl Drop for Teardown {
+        fn drop(&mut self) {
+            // This will run even if the test panics
+            let status = std::process::Command::new("bash")
+                .arg("test/script/plugin/pkcs11/delete_by_label.sh")
+                .arg(LOOKUP_LABEL)
+                .arg(HSM_USER_PIN)
+                .arg(SOFTHSM_PATH)
+                .status()
+                .expect("failed to run teardown script");
+            assert!(status.success(), "teardown script failed");
+        }
     }
-
 
     const TEST_DATA: &[u8] = b"testdata";
-
-
-
 
     // This will only work if SoftHSM is setup accordingly.
     #[tokio::test]
@@ -344,7 +345,7 @@ mod tests {
             // This pin must be set for SoftHSM
             pin: HSM_USER_PIN.to_string(),
             rsa_mechanism: RsaPkcsTest,
-            lookup_label: "".into()
+            lookup_label: "".into(),
         };
 
         let backend = Pkcs11Backend::try_from(config).unwrap();
@@ -372,13 +373,14 @@ mod tests {
     #[serial]
     async fn wrap_and_unwrap_data() {
         before_test().await;
-         let config = Pkcs11Config {
+        let _teardown = Teardown;
+        let config = Pkcs11Config {
             module: SOFTHSM_PATH.into(),
             slot_index: 0,
             // This pin must be set for SoftHSM
             pin: HSM_USER_PIN.to_string(),
             rsa_mechanism: RsaPkcsTest,
-            lookup_label: LOOKUP_LABEL.to_string()
+            lookup_label: LOOKUP_LABEL.to_string(),
         };
 
         let backend = Pkcs11Backend::try_from(config).unwrap();
@@ -392,27 +394,26 @@ mod tests {
         let unwrapped = backend.wrapkey_unwrap(&wrapped).await.unwrap();
 
         assert_eq!(data.as_bytes(), unwrapped);
-        after_test().await;
     }
     #[tokio::test]
-    #[should_panic(expected= "PKCS11 error")]
+    #[should_panic(expected = "PKCS11 error")]
     #[serial]
     async fn expected_failure_using_softhsm_mfg_sha256() {
         before_test().await;
+        let _teardown = Teardown;
+
         let config = Pkcs11Config {
             module: SOFTHSM_PATH.into(),
             slot_index: 0,
             // This pin must be set for SoftHSM
             pin: HSM_USER_PIN.to_string(),
             rsa_mechanism: RsaPkcsOaep,
-            lookup_label: LOOKUP_LABEL.to_string()
+            lookup_label: LOOKUP_LABEL.to_string(),
         };
         let backend = Pkcs11Backend::try_from(config).unwrap();
 
         let data = "TEST";
 
         let _wrapped = backend.wrapkey_wrap(data.as_bytes()).await.unwrap();
-        after_test().await;
-
-    }    
+    }
 }
