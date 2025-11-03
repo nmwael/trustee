@@ -86,7 +86,7 @@ jobs:
       working-directory: kbs
       run: |
         echo "Setting up PKCS#11 for ${{ matrix.instance }}"
-        apt-get install -y --no-install-recommends softhsm2
+        sudo apt-get install -y --no-install-recommends softhsm2
         softhsm2-util --init-token --free --label "Trustee pkcs11 test" --so-pin 12345678 --pin 12345678
 
     - name: Test
