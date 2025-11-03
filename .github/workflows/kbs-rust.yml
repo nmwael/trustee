@@ -85,8 +85,8 @@ jobs:
       if: contains(matrix.test_features, 'pkcs11')
       working-directory: kbs
       run: |
-        echo "SETUP softhsm ${{ matrix.instance }}"
-        sudo apt-get install -y --no-install-recommends softhsm2
+        echo "SETUP tools for pkcs11 ${{ matrix.instance }}"
+        sudo apt-get install -y --no-install-recommends softhsm2 opensc
         mkdir -p "$HOME/softhsm/tokens"
         echo "directories.tokendir = $HOME/softhsm/tokens" > "$HOME/softhsm/softhsm2.conf"
         export SOFTHSM2_CONF="$HOME/softhsm/softhsm2.conf"
