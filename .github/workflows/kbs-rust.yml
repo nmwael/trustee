@@ -85,10 +85,14 @@ jobs:
       if: contains(matrix.test_features, 'pkcs11')
       working-directory: kbs
       run: |
-        echo "Setting up PKCS#11 for ${{ matrix.instance }}"
+        echo "SETUP softhsm ${{ matrix.instance }}"
         sudo apt-get install -y --no-install-recommends softhsm2
+        mkdir -p "$HOME/softhsm/tokens"
+        echo "directories.tokendir = $HOME/softhsm/tokens" > "$HOME/softhsm/softhsm2.conf"
+        export SOFTHSM2_CONF="$HOME/softhsm/softhsm2.conf"
         softhsm2-util --init-token --free --label "Trustee pkcs11 test" --so-pin 12345678 --pin 12345678
-
     - name: Test
       working-directory: kbs
+      env:
+        SOFTHSM2_CONF: '$HOME/softhsm/softhsm2.conf'
       run: make check TEST_FEATURES=${{ matrix.test_features }}
