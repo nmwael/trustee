@@ -12,10 +12,9 @@ use crate::plugins::resource::{ResourceDesc, StorageBackend};
 use actix_web::http::Method;
 use anyhow::{anyhow, bail, Context, Result};
 use cryptoki::{
-    context::{CInitializeArgs, Pkcs11},
+    context::{CInitializeArgs, CInitializeFlags, Pkcs11},
     mechanism::{
-        rsa::{PkcsMgfType, PkcsOaepParams, PkcsOaepSource},
-        Mechanism, MechanismType,
+        Mechanism, MechanismType, rsa::{PkcsMgfType, PkcsOaepParams, PkcsOaepSource}
     },
     object::{Attribute, AttributeInfo, AttributeType, KeyType, ObjectClass},
     session::{Session, UserType},
@@ -24,7 +23,6 @@ use cryptoki::{
 use educe::Educe;
 use serde::Deserialize;
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
-use tokio::sync::Mutex;
 
 use super::super::plugin_manager::ClientPlugin;
 
@@ -84,7 +82,9 @@ pub struct Pkcs11Config {
 }
 
 pub struct Pkcs11Backend {
-    session: Arc<Mutex<Session>>,
+    pkcs11: Arc<Pkcs11>,
+    slot: cryptoki::slot::Slot,
+    pin: String,
     lookup_label: String,
     rsa_mechanism: Arc<RsaMechanism>,
 }
@@ -92,28 +92,38 @@ pub struct Pkcs11Backend {
 impl TryFrom<Pkcs11Config> for Pkcs11Backend {
     type Error = anyhow::Error;
 
-    fn try_from(config: Pkcs11Config) -> anyhow::Result<Self> {
-        let rsa_mechanism = Arc::new(config.rsa_mechanism);
-        let pkcs11 = Pkcs11::new(config.module).context("unable to open pkcs11 module")?;
-        pkcs11.initialize(CInitializeArgs::OsThreads).unwrap();
+    fn try_from(config: Pkcs11Config) -> Result<Self> {
+        let pkcs11 = Pkcs11::new(&config.module)
+            .context("unable to open pkcs11 module")?;
+
+        pkcs11.initialize(CInitializeArgs::new(CInitializeFlags::OS_LOCKING_OK))?;
 
         let slots = pkcs11.get_slots_with_token()?;
         let slot_index = usize::from(config.slot_index);
+
         if slot_index >= slots.len() {
             bail!("Slot index out of range");
         }
 
-        let session = pkcs11.open_rw_session(slots[slot_index])?;
-        session.login(UserType::User, Some(&AuthPin::new(config.pin.clone())))?;
-
-        let lookup_label = config.lookup_label;
         Ok(Self {
-            session: Arc::new(Mutex::new(session)),
-            rsa_mechanism: rsa_mechanism.clone(),
-            lookup_label,
+            pkcs11: Arc::new(pkcs11),
+            slot: slots[slot_index],
+            pin: config.pin,
+            lookup_label: config.lookup_label,
+            rsa_mechanism: Arc::new(config.rsa_mechanism),
         })
     }
 }
+
+impl Pkcs11Backend {
+    /// Open a fresh session for each operation.
+    fn open_session(&self) -> Result<Session> {
+        let session = self.pkcs11.open_rw_session(self.slot)?;
+        session.login(UserType::User, Some(&AuthPin::new(self.pin.clone().into_boxed_str())))?;
+        Ok(session)
+    }
+}
+
 
 #[async_trait::async_trait]
 impl ClientPlugin for Pkcs11Backend {
@@ -165,53 +175,50 @@ impl ClientPlugin for Pkcs11Backend {
 
 #[async_trait::async_trait]
 impl StorageBackend for Pkcs11Backend {
-    async fn read_secret_resource(&self, resource_desc: ResourceDesc) -> Result<Vec<u8>> {
-        let session = self.session.lock().await;
+async fn read_secret_resource(&self, resource_desc: ResourceDesc) -> Result<Vec<u8>> {
+    let session = self.open_session()?;
 
-        // find object with matching label
-        let attributes = vec![Attribute::Label(Vec::from(resource_desc.to_string()))];
-        let objects = session.find_objects(&attributes)?;
+    let attributes = vec![Attribute::Label(Vec::from(resource_desc.to_string()))];
+    let objects = session.find_objects(&attributes)?;
 
-        if objects.is_empty() {
-            bail!("Could not find object with label {}", resource_desc);
-        }
-        let object = objects[0];
-
-        // check that object has a readable value attribute
-        let value_attribute = vec![AttributeType::Value];
-        let attribute_map = session.get_attribute_info_map(object, &value_attribute)?;
-        let Some(AttributeInfo::Available(_size)) = attribute_map.get(&AttributeType::Value) else {
-            bail!("Key does not have value attribute available.");
-        };
-
-        // get the value
-        let value = &session
-            .get_attributes(object, &value_attribute)
-            .context("unable to fetch attributes")?;
-
-        let value = value.first().ok_or(anyhow!("empty attributes returned"))?;
-
-        let Attribute::Value(resource_bytes) = value else {
-            bail!("Failed to get value.");
-        };
-
-        Ok(resource_bytes.clone())
+    if objects.is_empty() {
+        bail!("Could not find object with label {}", resource_desc);
     }
 
-    async fn write_secret_resource(&self, resource_desc: ResourceDesc, data: &[u8]) -> Result<()> {
-        let attributes = vec![
-            Attribute::Class(ObjectClass::SECRET_KEY),
-            Attribute::KeyType(KeyType::GENERIC_SECRET),
-            Attribute::Extractable(true),
-            Attribute::Private(true),
-            Attribute::Value(data.to_vec()),
-            Attribute::Label(Vec::from(resource_desc.to_string())),
-        ];
+    let object = objects[0];
 
-        let _object = self.session.lock().await.create_object(&attributes)?;
+    let value_attribute = vec![AttributeType::Value];
+    let attribute_map = session.get_attribute_info_map(object, &value_attribute)?;
 
-        Ok(())
-    }
+    let Some(AttributeInfo::Available(_)) = attribute_map.get(&AttributeType::Value) else {
+        bail!("Key does not have value attribute available.");
+    };
+
+    let attrs = session.get_attributes(object, &value_attribute)?;
+    let Attribute::Value(bytes) = attrs.first().ok_or(anyhow!("empty attributes returned"))? else {
+        bail!("Failed to get value.");
+    };
+
+    Ok(bytes.clone())
+}
+
+
+   async fn write_secret_resource(&self, resource_desc: ResourceDesc, data: &[u8]) -> Result<()> {
+    let session = self.open_session()?;
+
+    let attributes = vec![
+        Attribute::Class(ObjectClass::SECRET_KEY),
+        Attribute::KeyType(KeyType::GENERIC_SECRET),
+        Attribute::Extractable(true),
+        Attribute::Private(true),
+        Attribute::Value(data.to_vec()),
+        Attribute::Label(Vec::from(resource_desc.to_string())),
+    ];
+
+    session.create_object(&attributes)?;
+    Ok(())
+}
+
 }
 
 impl Pkcs11Backend {
@@ -237,57 +244,52 @@ impl Pkcs11Backend {
     }
 
     async fn wrapkey_wrap(&self, body: &[u8]) -> Result<Vec<u8>> {
-        let pubkey_template = vec![
-            Attribute::Label(self.lookup_label.clone().into()),
-            Attribute::Class(ObjectClass::PUBLIC_KEY),
-        ];
+    let session = self.open_session()?;
 
-        let mut pubkey = self
-            .session
-            .lock()
-            .await
-            .find_objects(&pubkey_template)
-            .context("unable to find public wrap key in PKCS11 module")?;
+    let pubkey_template = vec![
+        Attribute::Label(self.lookup_label.clone().into()),
+        Attribute::Class(ObjectClass::PUBLIC_KEY),
+    ];
 
-        let encrypted = self
-            .session
-            .lock()
-            .await
-            .encrypt(
-                &self.rsa_mechanism.to_pkcs11_mechanism(),
-                pubkey.remove(0),
-                body,
-            )
-            .context("unable to encrypt HTTP body with public wrap key")?;
+    let mut pubkey = session
+        .find_objects(&pubkey_template)
+        .context("unable to find public wrap key in PKCS11 module")?;
 
-        Ok(encrypted)
-    }
+    let encrypted = session
+        .encrypt(
+            &self.rsa_mechanism.to_pkcs11_mechanism(),
+            pubkey.remove(0),
+            body,
+        )
+        .context("unable to encrypt HTTP body with public wrap key")?;
+
+    Ok(encrypted)
+}
+
 
     async fn wrapkey_unwrap(&self, body: &[u8]) -> Result<Vec<u8>> {
-        let privkey_template = vec![
-            Attribute::Label(self.lookup_label.clone().into()),
-            Attribute::Class(ObjectClass::PRIVATE_KEY),
-        ];
+    let session = self.open_session()?;
 
-        let mut privkey = self
-            .session
-            .lock()
-            .await
-            .find_objects(&privkey_template)
-            .context("unable to find private wrap key in PKCS11 module")?;
-        let decrypted = self
-            .session
-            .lock()
-            .await
-            .decrypt(
-                &self.rsa_mechanism.to_pkcs11_mechanism(),
-                privkey.remove(0),
-                body,
-            )
-            .context("unable to decrypt HTTP body with private wrap key")?;
+    let privkey_template = vec![
+        Attribute::Label(self.lookup_label.clone().into()),
+        Attribute::Class(ObjectClass::PRIVATE_KEY),
+    ];
 
-        Ok(decrypted)
-    }
+    let mut privkey = session
+        .find_objects(&privkey_template)
+        .context("unable to find private wrap key in PKCS11 module")?;
+
+    let decrypted = session
+        .decrypt(
+            &self.rsa_mechanism.to_pkcs11_mechanism(),
+            privkey.remove(0),
+            body,
+        )
+        .context("unable to decrypt HTTP body with private wrap key")?;
+
+    Ok(decrypted)
+}
+
 }
 /// In general tests using softhsm has to run in a serial scope as they are session locked
 #[cfg(test)]
