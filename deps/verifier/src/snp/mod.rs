@@ -4,7 +4,6 @@ use self::serde::{Deserialize, Serialize};
 use anyhow::anyhow;
 use asn1_rs::{oid, FromDer, Integer, OctetString, Oid};
 use async_trait::async_trait;
-use base64::{engine::general_purpose::STANDARD, Engine};
 use http_cache_reqwest::{
     Cache, CacheMode, HttpCache, HttpCacheOptions, MokaCacheBuilder, MokaManager,
 };
@@ -64,6 +63,9 @@ pub(crate) const FMC_SPL_OID: Oid<'static> = oid!(1.3.6 .1 .4 .1 .3704 .1 .3 .9)
 const KDS_CERT_SITE: &str = "https://kdsintf.amd.com";
 const KDS_VCEK: &str = "/vcek/v1";
 
+// KDS Offline Store
+const KDS_OFFLINE_STORE_PATH: &str = "/opt/confidential-containers/attestation-service/kds-store";
+
 /// Attestation report versions supported
 const REPORT_VERSION_MIN: u32 = 3;
 const REPORT_VERSION_MAX: u32 = 5;
@@ -106,24 +108,26 @@ fn init_cache_manager() -> MokaManager {
 }
 
 #[derive(Clone, Debug, Default)]
-pub struct Snp {}
+pub struct Snp {
+    verifier_config: SnpVerifierConfig,
+}
 
 impl Snp {
-    pub async fn new() -> Result<Self> {
-        Ok(Snp {})
+    pub async fn new(config: Option<SnpVerifierConfig>) -> Result<Self> {
+        Ok(Snp {
+            verifier_config: config.unwrap_or_default(),
+        })
     }
 
-    pub fn build_vcek_client(&self) -> reqwest_middleware::ClientWithMiddleware {
+    fn build_vcek_client(&self) -> reqwest_middleware::ClientWithMiddleware {
         let client_options = HttpCacheOptions {
             cache_status_headers: true,
             ..Default::default()
         };
 
-        let manager = VCEK_CACHE_MANAGER.get_or_init(init_cache_manager).clone();
-
         let cache = Cache(HttpCache {
             mode: CacheMode::Default,
-            manager,
+            manager: VCEK_CACHE_MANAGER.get_or_init(init_cache_manager).clone(),
             options: client_options,
         });
 
@@ -132,25 +136,79 @@ impl Snp {
             .build()
     }
 
+    /// Fetches VCEK by trying each configured source in order until one succeeds
+    async fn fetch_vcek(
+        &self,
+        att_report: AttestationReport,
+        proc_gen: ProcessorGeneration,
+    ) -> Result<Vec<u8>> {
+        for source in &self.verifier_config.vcek_sources {
+            let result = match source {
+                VCEKSource::OfflineStore { path } => {
+                    self.fetch_vcek_from_offline_store(att_report, &proc_gen, path.clone())
+                }
+                VCEKSource::KDS { base_url } => {
+                    self.fetch_vcek_from_kds(att_report, &proc_gen, base_url.clone())
+                        .await
+                }
+            };
+
+            if let Ok(vcek_bytes) = result {
+                debug!("fetched vcek from {:?}", source);
+                return Ok(vcek_bytes);
+            }
+        }
+
+        debug!(
+            "failed to fetch vcek from all configured sources {:?}",
+            self.verifier_config.vcek_sources
+        );
+        bail!("Failed to fetch VCEK from any configured source")
+    }
+
+    fn fetch_vcek_from_offline_store(
+        &self,
+        att_report: AttestationReport,
+        proc_gen: &ProcessorGeneration,
+        path: Option<String>,
+    ) -> Result<Vec<u8>> {
+        // default dir should contain the /vcek segment
+        let path = path.unwrap_or(KDS_OFFLINE_STORE_PATH.to_string());
+        let hw_id = self.parse_hw_id_from_vcek(att_report, proc_gen.clone());
+        let vcek_path = format!("{}/vcek/{}/vcek.der", path, hw_id);
+        let vcek_bytes = std::fs::read(&vcek_path)
+            .with_context(|| format!("Failed to read VCEK from offline store at {}", vcek_path))?;
+        Ok(vcek_bytes)
+    }
+
+    fn parse_hw_id_from_vcek(
+        &self,
+        att_report: AttestationReport,
+        proc_gen: ProcessorGeneration,
+    ) -> String {
+        match proc_gen {
+            ProcessorGeneration::Turin => {
+                let shorter_bytes: &[u8] = &att_report.chip_id[0..8];
+                hex::encode(shorter_bytes)
+            }
+            _ => hex::encode(att_report.chip_id),
+        }
+    }
+
     /// Asynchronously fetches the VCEK from the Key Distribution Service (KDS) using the provided attestation report.
     /// Returns the VCEK in DER format.
     async fn fetch_vcek_from_kds(
         &self,
         att_report: AttestationReport,
-        proc_gen: ProcessorGeneration,
+        proc_gen: &ProcessorGeneration,
+        kds_url: Option<String>,
     ) -> Result<Vec<u8>> {
         // Use attestation report to get data for URL
         if att_report.chip_id.as_slice() == [0; 64] {
             bail!("Hardware ID is 0s on attestation report. Confirm that MASK_CHIP_ID is set to 0 to request VCEK from KDS.");
         }
 
-        let hw_id = match proc_gen {
-            ProcessorGeneration::Turin => {
-                let shorter_bytes: &[u8] = &att_report.chip_id[0..8];
-                hex::encode(shorter_bytes)
-            }
-            _ => hex::encode(att_report.chip_id),
-        };
+        let hw_id = self.parse_hw_id_from_vcek(att_report, proc_gen.clone());
 
         // Request VCEK from KDS
         let vcek_url: String = match proc_gen {
@@ -160,8 +218,9 @@ impl Snp {
                 };
 
                 format!(
-                    "{KDS_CERT_SITE}{KDS_VCEK}/{}/\
+                    "{}{KDS_VCEK}/{}/\
                     {hw_id}?fmcSPL={:02}&blSPL={:02}&teeSPL={:02}&snpSPL={:02}&ucodeSPL={:02}",
+                    kds_url.unwrap_or(KDS_CERT_SITE.to_string()),
                     proc_gen,
                     fmc,
                     att_report.reported_tcb.bootloader,
@@ -172,8 +231,9 @@ impl Snp {
             }
             _ => {
                 format!(
-                    "{KDS_CERT_SITE}{KDS_VCEK}/{}/\
+                    "{}{KDS_VCEK}/{}/\
                     {hw_id}?blSPL={:02}&teeSPL={:02}&snpSPL={:02}&ucodeSPL={:02}",
+                    kds_url.unwrap_or(KDS_CERT_SITE.to_string()),
                     proc_gen,
                     att_report.reported_tcb.bootloader,
                     att_report.reported_tcb.tee,
@@ -220,6 +280,31 @@ impl Snp {
             status => bail!("Unable to fetch VCEK from URL: {status:?}, {vcek_url:?}"),
         }
     }
+}
+
+fn default_vcek_sources() -> Vec<VCEKSource> {
+    vec![VCEKSource::KDS { base_url: None }]
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct SnpVerifierConfig {
+    #[serde(default = "default_vcek_sources")]
+    pub vcek_sources: Vec<VCEKSource>,
+}
+
+impl Default for SnpVerifierConfig {
+    fn default() -> Self {
+        Self {
+            vcek_sources: default_vcek_sources(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(tag = "type")]
+pub enum VCEKSource {
+    OfflineStore { path: Option<String> },
+    KDS { base_url: Option<String> },
 }
 
 #[derive(Clone, Debug)]
@@ -349,13 +434,13 @@ impl Verifier for Snp {
                 vek.clone()
             }
 
-            // No certificate chain provided, so we need to request the VCEK from KDS
+            // No certificate chain provided, so we need to request the VCEK from configured sources
             _ => {
-                // Get VCEK from KDS
+                // Get VCEK from configured sources (tries each in order)
                 let vcek_buf = self
-                    .fetch_vcek_from_kds(report, proc_gen.clone())
+                    .fetch_vcek(report, proc_gen.clone())
                     .await
-                    .context("Failed to fetch VCEK from KDS")?;
+                    .context("Failed to fetch VCEK from any configured source")?;
                 let vcek = Certificate::from_bytes(&vcek_buf)
                     .context("Failed to convert KDS VCEK into certificate")?;
 
@@ -511,6 +596,7 @@ pub(crate) fn verify_report_tcb(
 
 /// Parses the attestation report and extracts the TEE evidence claims.
 /// Returns a JSON-formatted map of parsed claims.
+/// Note: Uses hex encoding for consistency with other verifiers (TDX, SGX, vTPM).
 pub(crate) fn parse_tee_evidence(report: &AttestationReport) -> TeeEvidenceParsedClaim {
     let claims_map = json!({
         // policy fields
@@ -532,9 +618,9 @@ pub(crate) fn parse_tee_evidence(report: &AttestationReport) -> TeeEvidenceParse
         "platform_smt_enabled": report.plat_info.smt_enabled(),
 
         // measurements
-        "measurement": STANDARD.encode(report.measurement),
-        "report_data": STANDARD.encode(report.report_data),
-        "init_data": STANDARD.encode(report.host_data),
+        "measurement": hex::encode(report.measurement),
+        "report_data": hex::encode(report.report_data),
+        "init_data": hex::encode(report.host_data),
     });
 
     claims_map as TeeEvidenceParsedClaim
@@ -555,7 +641,9 @@ pub(crate) fn get_common_name(cert: &x509::X509) -> Result<String> {
 }
 
 /// Determines the processor model based on the family and model IDs from the attestation report.
-fn get_processor_generation(att_report: &AttestationReport) -> Result<ProcessorGeneration> {
+pub(crate) fn get_processor_generation(
+    att_report: &AttestationReport,
+) -> Result<ProcessorGeneration> {
     let cpu_fam = att_report
         .cpuid_fam_id
         .ok_or_else(|| anyhow::anyhow!("Attestation report version 3+ is missing CPU family ID"))?;
@@ -895,5 +983,57 @@ mod tests {
             .verify()
             .context("Report signature verification against VEK signature failed")
             .unwrap();
+    }
+
+    #[test]
+    fn test_hex_encoding_in_parsed_claims() {
+        // Parse attestation report
+        let attestation_report = AttestationReport::from_bytes(VCEK_REPORT).unwrap();
+
+        // Generate parsed claims
+        let claims = parse_tee_evidence(&attestation_report);
+
+        // Extract the three key fields that should be hex-encoded
+        let measurement = claims.get("measurement").and_then(|v| v.as_str()).unwrap();
+        let report_data = claims.get("report_data").and_then(|v| v.as_str()).unwrap();
+        let init_data = claims.get("init_data").and_then(|v| v.as_str()).unwrap();
+
+        // Verify they are valid hex strings by checking:
+        // 1. All characters are valid hex digits (0-9, a-f)
+        // 2. Length matches expected byte count * 2 (hex encoding doubles the length)
+
+        // measurement is 48 bytes -> 96 hex chars
+        assert_eq!(
+            measurement.len(),
+            96,
+            "measurement should be 96 hex characters"
+        );
+        assert!(
+            measurement.chars().all(|c| c.is_ascii_hexdigit()),
+            "measurement should only contain hex digits"
+        );
+
+        // report_data is 64 bytes -> 128 hex chars
+        assert_eq!(
+            report_data.len(),
+            128,
+            "report_data should be 128 hex characters"
+        );
+        assert!(
+            report_data.chars().all(|c| c.is_ascii_hexdigit()),
+            "report_data should only contain hex digits"
+        );
+
+        // init_data (host_data) is 32 bytes -> 64 hex chars
+        assert_eq!(init_data.len(), 64, "init_data should be 64 hex characters");
+        assert!(
+            init_data.chars().all(|c| c.is_ascii_hexdigit()),
+            "init_data should only contain hex digits"
+        );
+
+        // Verify we can decode them back to bytes (confirms valid hex encoding)
+        hex::decode(measurement).expect("measurement should be valid hex");
+        hex::decode(report_data).expect("report_data should be valid hex");
+        hex::decode(init_data).expect("init_data should be valid hex");
     }
 }
