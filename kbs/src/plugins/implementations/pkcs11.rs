@@ -14,7 +14,8 @@ use anyhow::{anyhow, bail, Context, Result};
 use cryptoki::{
     context::{CInitializeArgs, CInitializeFlags, Pkcs11},
     mechanism::{
-        Mechanism, MechanismType, rsa::{PkcsMgfType, PkcsOaepParams, PkcsOaepSource}
+        rsa::{PkcsMgfType, PkcsOaepParams, PkcsOaepSource},
+        Mechanism, MechanismType,
     },
     object::{Attribute, AttributeInfo, AttributeType, KeyType, ObjectClass},
     session::{Session, UserType},
@@ -22,9 +23,22 @@ use cryptoki::{
 };
 use educe::Educe;
 use serde::Deserialize;
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{
+    cell::RefCell,
+    collections::HashMap,
+    path::PathBuf,
+    sync::{Arc, OnceLock},
+    thread,
+};
 
 use super::super::plugin_manager::ClientPlugin;
+
+// Session is Send but NOT Sync: it can be moved between threads
+// but cannot be shared. Each thread must have its own Session instance.
+thread_local! {
+    static PKCS11_SESSION: RefCell<Option<Session>> = const { RefCell::new(None) };
+}
+static PKCS11_CTX: OnceLock<Pkcs11> = OnceLock::new();
 
 /// Enum representing supported RSA mechanisms.
 #[derive(Educe, Deserialize, Clone, PartialEq, Default)]
@@ -82,7 +96,6 @@ pub struct Pkcs11Config {
 }
 
 pub struct Pkcs11Backend {
-    pkcs11: Arc<Pkcs11>,
     slot: cryptoki::slot::Slot,
     pin: String,
     lookup_label: String,
@@ -93,8 +106,7 @@ impl TryFrom<Pkcs11Config> for Pkcs11Backend {
     type Error = anyhow::Error;
 
     fn try_from(config: Pkcs11Config) -> Result<Self> {
-        let pkcs11 = Pkcs11::new(&config.module)
-            .context("unable to open pkcs11 module")?;
+        let pkcs11 = Pkcs11::new(&config.module).context("unable to open pkcs11 module")?;
 
         pkcs11.initialize(CInitializeArgs::new(CInitializeFlags::OS_LOCKING_OK))?;
 
@@ -104,9 +116,11 @@ impl TryFrom<Pkcs11Config> for Pkcs11Backend {
         if slot_index >= slots.len() {
             bail!("Slot index out of range");
         }
+        PKCS11_CTX
+            .set(pkcs11)
+            .expect("PKCS11 context already initialized");
 
         Ok(Self {
-            pkcs11: Arc::new(pkcs11),
             slot: slots[slot_index],
             pin: config.pin,
             lookup_label: config.lookup_label,
@@ -116,14 +130,70 @@ impl TryFrom<Pkcs11Config> for Pkcs11Backend {
 }
 
 impl Pkcs11Backend {
-    /// Open a fresh session for each operation.
-    fn open_session(&self) -> Result<Session> {
-        let session = self.pkcs11.open_rw_session(self.slot)?;
-        session.login(UserType::User, Some(&AuthPin::new(self.pin.clone().into_boxed_str())))?;
+    fn open_authenticated_session(&self) -> Result<Session> {
+        let pkcs11 = PKCS11_CTX.get().context("PKCS11 context not initialized")?;
+
+        let session = pkcs11.open_rw_session(self.slot)?;
+        let user_pin = AuthPin::new(self.pin.clone().into_boxed_str());
+        session.login(UserType::User, Some(&user_pin))?;
         Ok(session)
     }
-}
 
+    fn with_session<F, R>(&self, f: F) -> Result<R>
+    where
+        F: FnOnce(&Session) -> Result<R>,
+    {
+        PKCS11_SESSION.with(|session_cell| {
+            let mut session_opt = session_cell.borrow_mut();
+
+            // Validate existing session by checking get_session_info().
+            // If this returns an error, the session handle is no longer valid.
+            let needs_reopen = session_opt
+                .as_ref()
+                .map(|s| {
+                    let session_info = s.get_session_info();
+                    println!(
+                        "Thread {:?}: Session info check: {:?}",
+                        thread::current().id(),
+                        session_info
+                    );
+                    session_info.is_err()
+                })
+                .unwrap_or(true);
+
+            if needs_reopen {
+                // Explicitly set to None to trigger Drop on the old session.
+                // This ensures C_CloseSession is called before opening a new session.
+                *session_opt = None;
+
+                // Get global context (cheap Arc clone)
+
+                let ctx = PKCS11_CTX
+                    .get()
+                    .expect("PKCS11 context should be initialized");
+
+                // Open new session (R/W)
+                let new_session = ctx.open_rw_session(self.slot)?;
+
+                // No need to login.
+
+                println!("Thread {:?}: Opened new RW session", thread::current().id());
+
+                // Store in thread-local storage
+                *session_opt = Some(new_session);
+            } else {
+                println!(
+                    "Thread {:?}: Reusing existing session",
+                    thread::current().id()
+                );
+            }
+
+            // Execute closure with session reference
+            let session_ref = session_opt.as_ref().expect("Session should exist");
+            f(session_ref)
+        })
+    }
+}
 
 #[async_trait::async_trait]
 impl ClientPlugin for Pkcs11Backend {
@@ -135,6 +205,8 @@ impl ClientPlugin for Pkcs11Backend {
         method: &Method,
     ) -> Result<Vec<u8>> {
         let desc = path.join("/");
+
+        let _session = self.open_authenticated_session()?;
 
         match &desc[..] {
             "wrap-key" => self.wrap_key_handle(body, method).await,
@@ -175,50 +247,50 @@ impl ClientPlugin for Pkcs11Backend {
 
 #[async_trait::async_trait]
 impl StorageBackend for Pkcs11Backend {
-async fn read_secret_resource(&self, resource_desc: ResourceDesc) -> Result<Vec<u8>> {
-    let session = self.open_session()?;
+    async fn read_secret_resource(&self, resource_desc: ResourceDesc) -> Result<Vec<u8>> {
+        self.with_session(|session| {
+            let attributes = vec![Attribute::Label(Vec::from(resource_desc.to_string()))];
+            let objects = session.find_objects(&attributes)?;
 
-    let attributes = vec![Attribute::Label(Vec::from(resource_desc.to_string()))];
-    let objects = session.find_objects(&attributes)?;
+            if objects.is_empty() {
+                bail!("Could not find object with label {}", resource_desc);
+            }
 
-    if objects.is_empty() {
-        bail!("Could not find object with label {}", resource_desc);
+            let object = objects[0];
+
+            let value_attribute = vec![AttributeType::Value];
+            let attribute_map = session.get_attribute_info_map(object, &value_attribute)?;
+
+            let Some(AttributeInfo::Available(_)) = attribute_map.get(&AttributeType::Value) else {
+                bail!("Key does not have value attribute available.");
+            };
+
+            let attrs = session.get_attributes(object, &value_attribute)?;
+            let Attribute::Value(bytes) =
+                attrs.first().ok_or(anyhow!("empty attributes returned"))?
+            else {
+                bail!("Failed to get value.");
+            };
+
+            Ok(bytes.clone())
+        })
     }
 
-    let object = objects[0];
+    async fn write_secret_resource(&self, resource_desc: ResourceDesc, data: &[u8]) -> Result<()> {
+        self.with_session(|session| {
+            let attributes = vec![
+                Attribute::Class(ObjectClass::SECRET_KEY),
+                Attribute::KeyType(KeyType::GENERIC_SECRET),
+                Attribute::Extractable(true),
+                Attribute::Private(true),
+                Attribute::Value(data.to_vec()),
+                Attribute::Label(Vec::from(resource_desc.to_string())),
+            ];
 
-    let value_attribute = vec![AttributeType::Value];
-    let attribute_map = session.get_attribute_info_map(object, &value_attribute)?;
-
-    let Some(AttributeInfo::Available(_)) = attribute_map.get(&AttributeType::Value) else {
-        bail!("Key does not have value attribute available.");
-    };
-
-    let attrs = session.get_attributes(object, &value_attribute)?;
-    let Attribute::Value(bytes) = attrs.first().ok_or(anyhow!("empty attributes returned"))? else {
-        bail!("Failed to get value.");
-    };
-
-    Ok(bytes.clone())
-}
-
-
-   async fn write_secret_resource(&self, resource_desc: ResourceDesc, data: &[u8]) -> Result<()> {
-    let session = self.open_session()?;
-
-    let attributes = vec![
-        Attribute::Class(ObjectClass::SECRET_KEY),
-        Attribute::KeyType(KeyType::GENERIC_SECRET),
-        Attribute::Extractable(true),
-        Attribute::Private(true),
-        Attribute::Value(data.to_vec()),
-        Attribute::Label(Vec::from(resource_desc.to_string())),
-    ];
-
-    session.create_object(&attributes)?;
-    Ok(())
-}
-
+            session.create_object(&attributes)?;
+            Ok(())
+        })
+    }
 }
 
 impl Pkcs11Backend {
@@ -244,52 +316,50 @@ impl Pkcs11Backend {
     }
 
     async fn wrapkey_wrap(&self, body: &[u8]) -> Result<Vec<u8>> {
-    let session = self.open_session()?;
+        self.with_session(|session| {
+            let pubkey_template = vec![
+                Attribute::Label(self.lookup_label.clone().into()),
+                Attribute::Class(ObjectClass::PUBLIC_KEY),
+            ];
 
-    let pubkey_template = vec![
-        Attribute::Label(self.lookup_label.clone().into()),
-        Attribute::Class(ObjectClass::PUBLIC_KEY),
-    ];
+            let mut pubkey = session
+                .find_objects(&pubkey_template)
+                .context("unable to find public wrap key in PKCS11 module")?;
 
-    let mut pubkey = session
-        .find_objects(&pubkey_template)
-        .context("unable to find public wrap key in PKCS11 module")?;
+            let encrypted = session
+                .encrypt(
+                    &self.rsa_mechanism.to_pkcs11_mechanism(),
+                    pubkey.remove(0),
+                    body,
+                )
+                .context("unable to encrypt HTTP body with public wrap key")?;
 
-    let encrypted = session
-        .encrypt(
-            &self.rsa_mechanism.to_pkcs11_mechanism(),
-            pubkey.remove(0),
-            body,
-        )
-        .context("unable to encrypt HTTP body with public wrap key")?;
-
-    Ok(encrypted)
-}
-
+            Ok(encrypted)
+        })
+    }
 
     async fn wrapkey_unwrap(&self, body: &[u8]) -> Result<Vec<u8>> {
-    let session = self.open_session()?;
+        self.with_session(|session| {
+            let privkey_template = vec![
+                Attribute::Label(self.lookup_label.clone().into()),
+                Attribute::Class(ObjectClass::PRIVATE_KEY),
+            ];
 
-    let privkey_template = vec![
-        Attribute::Label(self.lookup_label.clone().into()),
-        Attribute::Class(ObjectClass::PRIVATE_KEY),
-    ];
+            let mut privkey = session
+                .find_objects(&privkey_template)
+                .context("unable to find private wrap key in PKCS11 module")?;
 
-    let mut privkey = session
-        .find_objects(&privkey_template)
-        .context("unable to find private wrap key in PKCS11 module")?;
+            let decrypted = session
+                .decrypt(
+                    &self.rsa_mechanism.to_pkcs11_mechanism(),
+                    privkey.remove(0),
+                    body,
+                )
+                .context("unable to decrypt HTTP body with private wrap key")?;
 
-    let decrypted = session
-        .decrypt(
-            &self.rsa_mechanism.to_pkcs11_mechanism(),
-            privkey.remove(0),
-            body,
-        )
-        .context("unable to decrypt HTTP body with private wrap key")?;
-
-    Ok(decrypted)
-}
-
+            Ok(decrypted)
+        })
+    }
 }
 /// In general tests using softhsm has to run in a serial scope as they are session locked
 #[cfg(test)]
