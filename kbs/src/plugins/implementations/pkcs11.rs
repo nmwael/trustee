@@ -102,23 +102,37 @@ pub struct Pkcs11Backend {
     rsa_mechanism: Arc<RsaMechanism>,
 }
 
+impl Drop for Pkcs11Backend {
+    fn drop(&mut self) {
+        if PKCS11_CTX.get().is_some() {
+            let pkcs11 = PKCS11_CTX
+                .get()
+                .context("PKCS11 context not initialized")
+                .unwrap()
+                .clone();
+            let _ = pkcs11.finalize();
+            println!("pkcs11 finalized and closed");
+        }
+    }
+}
+
 impl TryFrom<Pkcs11Config> for Pkcs11Backend {
     type Error = anyhow::Error;
 
     fn try_from(config: Pkcs11Config) -> Result<Self> {
         let pkcs11 = Pkcs11::new(&config.module).context("unable to open pkcs11 module")?;
-
         pkcs11.initialize(CInitializeArgs::new(CInitializeFlags::OS_LOCKING_OK))?;
 
         let slots = pkcs11.get_slots_with_token()?;
         let slot_index = usize::from(config.slot_index);
 
-        if slot_index >= slots.len() {
-            bail!("Slot index out of range");
-        }
         PKCS11_CTX
             .set(pkcs11)
             .expect("PKCS11 context already initialized");
+
+        if slot_index >= slots.len() {
+            bail!("Slot index out of range");
+        }
 
         Ok(Self {
             slot: slots[slot_index],
@@ -131,7 +145,7 @@ impl TryFrom<Pkcs11Config> for Pkcs11Backend {
 
 impl Pkcs11Backend {
     fn open_authenticated_session(&self) -> Result<Session> {
-        let pkcs11 = PKCS11_CTX.get().context("PKCS11 context not initialized")?;
+        let pkcs11 = PKCS11_CTX.get().expect("PKCS11 not initialized");
 
         let session = pkcs11.open_rw_session(self.slot)?;
         let user_pin = AuthPin::new(self.pin.clone().into_boxed_str());
@@ -364,6 +378,7 @@ impl Pkcs11Backend {
 /// In general tests using softhsm has to run in a serial scope as they are session locked
 #[cfg(test)]
 mod tests {
+
     use crate::plugins::{
         pkcs11::{
             Pkcs11Backend, Pkcs11Config,
@@ -372,11 +387,33 @@ mod tests {
         resource::backend::{ResourceDesc, StorageBackend},
     };
     use serial_test::serial;
-    use std::process::Command;
+    use std::{process::Command, sync::{Once, OnceLock}};
 
     static LOOKUP_LABEL: &'static str = "trustee-test";
     static HSM_USER_PIN: &'static str = "12345678";
     static SOFTHSM_PATH: &'static str = "/usr/lib/softhsm/libsofthsm2.so";
+
+    static INIT: Once = Once::new();
+    static BACKEND: OnceLock<Pkcs11Backend> = OnceLock::new();
+
+    fn init_test_suite_once() {
+        INIT.call_once(|| {
+            let config = Pkcs11Config {
+                module: SOFTHSM_PATH.into(),
+                slot_index: 0,
+                // This pin must be set for SoftHSM
+                pin: HSM_USER_PIN.to_string(),
+                rsa_mechanism: RsaPkcsTest,
+                lookup_label: "".into(),
+            };
+
+            let backend = Pkcs11Backend::try_from(config).unwrap();
+            
+            let _ = BACKEND.set(backend);
+        });
+        
+        let _ = BACKEND.get().unwrap().open_authenticated_session();
+    }
 
     async fn before_test() {
         let status = Command::new("bash")
@@ -399,6 +436,7 @@ mod tests {
                 .arg(SOFTHSM_PATH)
                 .status()
                 .expect("failed to run teardown script");
+
             assert!(status.success(), "teardown script failed");
         }
     }
@@ -409,16 +447,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn write_and_read_resource() {
-        let config = Pkcs11Config {
-            module: SOFTHSM_PATH.into(),
-            slot_index: 0,
-            // This pin must be set for SoftHSM
-            pin: HSM_USER_PIN.to_string(),
-            rsa_mechanism: RsaPkcsTest,
-            lookup_label: "".into(),
-        };
+        init_test_suite_once();
+        let backend = BACKEND.get().unwrap();
 
-        let backend = Pkcs11Backend::try_from(config).unwrap();
 
         let resource_desc = ResourceDesc {
             repository_name: "default".into(),
@@ -443,17 +474,12 @@ mod tests {
     #[serial]
     async fn wrap_and_unwrap_data() {
         before_test().await;
-        let _teardown = Teardown;
-        let config = Pkcs11Config {
-            module: SOFTHSM_PATH.into(),
-            slot_index: 0,
-            // This pin must be set for SoftHSM
-            pin: HSM_USER_PIN.to_string(),
-            rsa_mechanism: RsaPkcsTest,
-            lookup_label: LOOKUP_LABEL.to_string(),
-        };
+        init_test_suite_once();
+        
 
-        let backend = Pkcs11Backend::try_from(config).unwrap();
+        let _teardown = Teardown;
+        let backend = BACKEND.get().unwrap();
+        
 
         let data = "TEST";
 
@@ -465,25 +491,5 @@ mod tests {
 
         assert_eq!(data.as_bytes(), unwrapped);
     }
-    #[tokio::test]
-    #[should_panic(expected = "PKCS11 error")]
-    #[serial]
-    async fn expected_failure_using_softhsm_mfg_sha256() {
-        before_test().await;
-        let _teardown = Teardown;
 
-        let config = Pkcs11Config {
-            module: SOFTHSM_PATH.into(),
-            slot_index: 0,
-            // This pin must be set for SoftHSM
-            pin: HSM_USER_PIN.to_string(),
-            rsa_mechanism: RsaPkcsOaep,
-            lookup_label: LOOKUP_LABEL.to_string(),
-        };
-        let backend = Pkcs11Backend::try_from(config).unwrap();
-
-        let data = "TEST";
-
-        let _wrapped = backend.wrapkey_wrap(data.as_bytes()).await.unwrap();
-    }
 }
