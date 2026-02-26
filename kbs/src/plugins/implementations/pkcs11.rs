@@ -180,16 +180,11 @@ impl Pkcs11Backend {
                 // This ensures C_CloseSession is called before opening a new session.
                 *session_opt = None;
 
-                // Get global context (cheap Arc clone)
-
-                let ctx = PKCS11_CTX
-                    .get()
-                    .expect("PKCS11 context should be initialized");
-
                 // Open new session (R/W)
-                let new_session = ctx.open_rw_session(self.slot)?;
+                
+                let new_session = self.open_authenticated_session()?;
 
-                // No need to login.
+
 
                 println!("Thread {:?}: Opened new RW session", thread::current().id());
 
@@ -219,8 +214,6 @@ impl ClientPlugin for Pkcs11Backend {
         method: &Method,
     ) -> Result<Vec<u8>> {
         let desc = path.join("/");
-
-        let _session = self.open_authenticated_session()?;
 
         match &desc[..] {
             "wrap-key" => self.wrap_key_handle(body, method).await,
@@ -396,6 +389,8 @@ mod tests {
     static INIT: Once = Once::new();
     static BACKEND: OnceLock<Pkcs11Backend> = OnceLock::new();
 
+
+
     fn init_test_suite_once() {
         INIT.call_once(|| {
             let config = Pkcs11Config {
@@ -404,15 +399,16 @@ mod tests {
                 // This pin must be set for SoftHSM
                 pin: HSM_USER_PIN.to_string(),
                 rsa_mechanism: RsaPkcsTest,
-                lookup_label: "".into(),
+                lookup_label: LOOKUP_LABEL.into(),
             };
 
             let backend = Pkcs11Backend::try_from(config).unwrap();
             
             let _ = BACKEND.set(backend);
+
+           
         });
-        
-        let _ = BACKEND.get().unwrap().open_authenticated_session();
+
     }
 
     async fn before_test() {
@@ -447,8 +443,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn write_and_read_resource() {
-        init_test_suite_once();
+        init_test_suite_once();        
         let backend = BACKEND.get().unwrap();
+
 
 
         let resource_desc = ResourceDesc {
@@ -476,10 +473,10 @@ mod tests {
         before_test().await;
         init_test_suite_once();
         
+        
 
         let _teardown = Teardown;
         let backend = BACKEND.get().unwrap();
-        
 
         let data = "TEST";
 
