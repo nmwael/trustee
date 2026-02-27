@@ -18,7 +18,7 @@ use cryptoki::{
         Mechanism, MechanismType,
     },
     object::{Attribute, AttributeInfo, AttributeType, KeyType, ObjectClass},
-    session::{Session, UserType},
+    session::{Session, SessionState, UserType},
     types::AuthPin,
 };
 use educe::Educe;
@@ -144,12 +144,21 @@ impl TryFrom<Pkcs11Config> for Pkcs11Backend {
 }
 
 impl Pkcs11Backend {
-    fn open_authenticated_session(&self) -> Result<Session> {
-        let pkcs11 = PKCS11_CTX.get().expect("PKCS11 not initialized");
+    fn main_session_login(&self) -> Result<Session> {
+        let pkcs11 = PKCS11_CTX.get().context("PKCS11 not initialized")?;
 
-        let session = pkcs11.open_rw_session(self.slot)?;
         let user_pin = AuthPin::new(self.pin.clone().into_boxed_str());
+        let session = pkcs11.open_rw_session(self.slot)?;
         session.login(UserType::User, Some(&user_pin))?;
+        Ok(session)
+    }
+
+    fn open_session(&self) -> Result<Session> {
+        let pkcs11 = PKCS11_CTX.get().context("PKCS11 not initialized")?;
+
+        // Open RW session (use RO if you truly only need reads)
+        let session = pkcs11.open_rw_session(self.slot)?;
+
         Ok(session)
     }
 
@@ -181,10 +190,8 @@ impl Pkcs11Backend {
                 *session_opt = None;
 
                 // Open new session (R/W)
-                
-                let new_session = self.open_authenticated_session()?;
 
-
+                let new_session = self.open_session()?;
 
                 println!("Thread {:?}: Opened new RW session", thread::current().id());
 
@@ -379,8 +386,19 @@ mod tests {
         },
         resource::backend::{ResourceDesc, StorageBackend},
     };
+    use cryptoki::{
+        mechanism::Mechanism,
+        object::{Attribute, KeyType, ObjectClass},
+    };
     use serial_test::serial;
-    use std::{process::Command, sync::{Once, OnceLock}};
+    use std::{
+        env,
+        process::Command,
+        sync::{Once, OnceLock},
+        thread,
+    };
+    use testresult::TestResult;
+    use tokio::runtime::Builder;
 
     static LOOKUP_LABEL: &'static str = "trustee-test";
     static HSM_USER_PIN: &'static str = "12345678";
@@ -388,8 +406,6 @@ mod tests {
 
     static INIT: Once = Once::new();
     static BACKEND: OnceLock<Pkcs11Backend> = OnceLock::new();
-
-
 
     fn init_test_suite_once() {
         INIT.call_once(|| {
@@ -403,12 +419,9 @@ mod tests {
             };
 
             let backend = Pkcs11Backend::try_from(config).unwrap();
-            
+
             let _ = BACKEND.set(backend);
-
-           
         });
-
     }
 
     async fn before_test() {
@@ -443,10 +456,8 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn write_and_read_resource() {
-        init_test_suite_once();        
+        init_test_suite_once();
         let backend = BACKEND.get().unwrap();
-
-
 
         let resource_desc = ResourceDesc {
             repository_name: "default".into(),
@@ -472,8 +483,6 @@ mod tests {
     async fn wrap_and_unwrap_data() {
         before_test().await;
         init_test_suite_once();
-        
-        
 
         let _teardown = Teardown;
         let backend = BACKEND.get().unwrap();
@@ -489,4 +498,194 @@ mod tests {
         assert_eq!(data.as_bytes(), unwrapped);
     }
 
+    #[tokio::test]
+    //@see https://github.com/parallaxsecond/rust-cryptoki/blob/main/cryptoki/examples/thread_local_session.rs
+    //@see https://github.com/parallaxsecond/rust-cryptoki/commit/d1b283ec622b30913647d3817aa0625394c1ecf3
+    async fn cryptoki_crate_example() -> TestResult {
+        init_test_suite_once();
+
+        println!("Thread-Local Session Pattern Example");
+        println!("====================================\n");
+        println!("This example demonstrates:");
+        println!("- Sharing Pkcs11 context across threads (via Arc)");
+        println!("- Per-thread Sessions (via thread_local!)");
+        println!("- Automatic session lifecycle management");
+        println!("- Session reuse within the same thread\n");
+
+        println!();
+
+        // Open a persistent session to maintain login state for the app's lifetime
+        let backend = BACKEND.get().unwrap();
+
+        let _persistent_session_a = backend.main_session_login()?;
+        println!("Persistent session opened to maintain login state.\n");
+
+        let max_threads = 2;
+
+        // Spawn multiple threads
+        println!("Spawning {max_threads} worker threads...\n");
+        let mut handles = vec![];
+
+        for thread_id in 0..max_threads {
+            let handle = thread::spawn(move || -> Result<(), anyhow::Error> {
+                println!(
+                    "Thread {:?} (worker {}): Starting operations",
+                    thread::current().id(),
+                    thread_id
+                );
+                let backend = BACKEND.get().unwrap();
+
+                // First call: generate keys
+                let (_public, private) = backend.with_session(|session| {
+                    println!(
+                        "Thread {:?} (worker {}): Generating RSA key pair",
+                        thread::current().id(),
+                        thread_id
+                    );
+
+                    let public_template = vec![
+                        Attribute::Token(false),
+                        Attribute::Private(true),
+                        Attribute::KeyType(KeyType::RSA),
+                        Attribute::Class(ObjectClass::PUBLIC_KEY),
+                        Attribute::ModulusBits(2048.into()),
+                        Attribute::PublicExponent(vec![0x01, 0x00, 0x01]), // 65537
+                        Attribute::Verify(true),
+                        Attribute::Label(format!("trustee-{}-public", thread_id).into()),
+                    ];
+
+                    let private_template = vec![
+                        Attribute::Token(false),
+                        Attribute::Private(true),
+                        Attribute::KeyType(KeyType::RSA),
+                        Attribute::Sign(true),
+                        Attribute::Class(ObjectClass::PRIVATE_KEY),
+                        Attribute::Label(format!("trustee-{}-private", thread_id).into()),
+                    ];
+
+                    // Generate key pair
+                    let keys = session.generate_key_pair(
+                        &Mechanism::RsaPkcsKeyPairGen,
+                        &public_template,
+                        &private_template,
+                    )?;
+
+                    println!(
+                        "Thread {:?} (worker {}): Keys generated (pub: {}, priv: {})",
+                        thread::current().id(),
+                        thread_id,
+                        keys.0.handle(),
+                        keys.1.handle()
+                    );
+
+                    Ok(keys)
+                })?;
+
+                // Second call: first signature (reuses the session)
+
+                backend.with_session(|session| {
+        let data = format!("Message 1 from thread Message 1 Message 1 from thread Message 1 from thread {}", thread_id);
+        let signature = session.sign(&Mechanism::RsaPkcs, private, data.as_bytes())?;
+        println!(
+            "Thread {:?} (worker {}): First signature: {} bytes",
+            thread::current().id(),
+            thread_id,
+            signature.len()
+        );
+        Ok(())
+    })?;
+
+                // Third call: second signature (reuses the session again)
+                backend.with_session(|session| {
+                    let data = format!(
+                        "Message 2 from thread Message 2 from thread Message 2 from thread {}",
+                        thread_id
+                    );
+                    let signature = session.sign(&Mechanism::RsaPkcs, private, data.as_bytes())?;
+                    println!(
+                        "Thread {:?} (worker {}): Second signature: {} bytes",
+                        thread::current().id(),
+                        thread_id,
+                        signature.len()
+                    );
+                    Ok(())
+                })?;
+
+                println!(
+                    "Thread {:?} (worker {}): All operations completed",
+                    thread::current().id(),
+                    thread_id
+                );
+                Ok(())
+            });
+            handles.push(handle);
+        }
+
+        // Wait for all threads and check results
+        println!();
+        for (i, handle) in handles.into_iter().enumerate() {
+            handle
+                .join()
+                .unwrap_or_else(|_| panic!("Thread {} panicked", i))?;
+        }
+
+        println!("\nAll threads completed successfully!");
+        println!(
+            "Note: Each thread had its own Session instance, reused across multiple operations."
+        );
+
+        // _persistent_session drops here, as Session implements Drop and objects on stack
+        // are dropped in reverse order of creation. Login state is cleaned up automatically.
+        // Since Session implements Drop, the compiler will not optimize _persistent_session away,
+        // and drop will happen as expected.
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn concurrency_thread() {
+        before_test().await;
+        init_test_suite_once();
+
+        let _teardown = Teardown;
+        let backend = BACKEND.get().unwrap();
+
+        let _main_session = backend.main_session_login().unwrap();
+
+        let max_threads = 2;
+
+        // Spawn multiple threads
+        println!("Spawning {max_threads} worker threads...\n");
+
+        let mut handles = Vec::new();
+
+        for _i in 0..max_threads {
+            let handle = std::thread::spawn(move || -> Result<(), anyhow::Error> {
+                let rt = Builder::new_current_thread().enable_all().build()?;
+
+                rt.block_on(async {
+                    let backend = BACKEND.get().unwrap();
+
+                    let data = "TEST";
+
+                    let wrapped = backend.wrapkey_wrap(data.as_bytes()).await?;
+                    assert_ne!(data.as_bytes(), wrapped);
+
+                    let unwrapped = backend.wrapkey_unwrap(&wrapped).await?;
+                    assert_eq!(data.as_bytes(), unwrapped);
+
+                    Ok(())
+                })
+            });
+
+            handles.push(handle);
+        }
+
+        // Join and propagate errors
+        for h in handles {
+            h.join()
+                .expect("thread panicked")
+                .expect("Pkcs11Backend failed wrapping unwrapping");
+        }
+    }
 }
